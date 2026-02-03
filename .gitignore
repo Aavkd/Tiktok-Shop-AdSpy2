@@ -1,0 +1,8 @@
+node_modules/
+puppeteer_cache/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+monitor_log.jsonl
+debug_response.txt
