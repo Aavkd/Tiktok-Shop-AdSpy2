@@ -2,3 +2,4 @@ requests
 protobuf
 selenium
 playwright
+apify

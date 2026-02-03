@@ -1,15 +1,24 @@
-import time
+import os
+import sys
 import json
 import logging
+import time
 import requests
-import os
+import asyncio
 from datetime import datetime, timedelta
+
+# Try importing Apify Actor SDK
+try:
+    from apify import Actor
+except ImportError:
+    Actor = None
 
 # Configuration
 SIGNATURE_SERVICE_URL = "http://localhost:8081/signature"
 MONITOR_LOG_FILE = "monitor_log.jsonl"
 DEBUG_LOG_FILE = "debug_response.txt"
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def get_signed_url(url):
@@ -41,7 +50,7 @@ def fetch_product_data(product_url):
         logging.error("Failed to get signed URL.")
         return None
 
-    signature_obj = signed_data.get("signed_url") # In my service, this is the signature object
+    signature_obj = signed_data.get("signed_url")
     cookies = signed_data.get("cookies")
     user_agent = signed_data.get("navigator", {}).get("user_agent")
     
@@ -61,7 +70,6 @@ def fetch_product_data(product_url):
         new_query = urlencode(query, doseq=True)
         signed_url = urlunparse(parsed._replace(query=new_query))
     else:
-        # Fallback if service returns full string (not current behavior but safe)
         signed_url = signature_obj if isinstance(signature_obj, str) else product_url
 
     headers = {
@@ -70,16 +78,10 @@ def fetch_product_data(product_url):
         "Referer": "https://www.tiktok.com/",
     }
 
-    # 2. Make the request
     try:
-        # Note: signed_url already contains X-Bogus and X-Gnarly as query params usually.
-        # But if the service returns them separately, we might need to add them.
-        # The README says signed_url has them.
-        
         response = requests.get(signed_url, headers=headers)
         response.raise_for_status()
         
-        # 3. Handle Response
         content_type = response.headers.get("Content-Type", "")
         
         # Debug save
@@ -95,7 +97,6 @@ def fetch_product_data(product_url):
                 return None
         else:
             logging.warning(f"Response content type is {content_type}. Might be Protobuf.")
-            # TODO: Add protobuf parsing if needed. For now, return None but log it.
             return None
 
     except requests.exceptions.RequestException as e:
@@ -103,30 +104,13 @@ def fetch_product_data(product_url):
         return None
 
 def extract_product_info(json_data, product_url):
-    """
-    Extracts relevant fields from the JSON response.
-    This function needs to be adapted based on the actual response structure.
-    """
-    # Placeholder logic based on common TikTok structures
-    # We will refine this once we see the actual JSON in debug_response.txt
-    
-    # Example structure (hypothetical):
-    # {"data": {"product_info": {"stock": 100, "sold_count": 500, "price": {"min": 10, "max": 20}}}}
-    
     try:
-        # Navigate to product info (deep get)
-        # This is highly dependent on the endpoint.
-        # Assuming we hit a product detail endpoint.
-        
         product_data = json_data.get("data", {})
-        
-        # If the response is empty or different, log it
         if not product_data:
             logging.warning("No 'data' field in JSON response.")
             return None
 
-        # Extract fields
-        item = product_data.get("product_info", {}) # Adjust key based on real response
+        item = product_data.get("product_info", {})
         
         return {
             "timestamp": datetime.now().isoformat(),
@@ -134,14 +118,14 @@ def extract_product_info(json_data, product_url):
             "product_id": item.get("product_id", "unknown"),
             "total_stock": item.get("stock", 0),
             "total_sold": item.get("sold_count", 0),
-            "price": item.get("price", {}).get("min_price", 0), # Simplified
-            "raw_response_snippet": str(json_data)[:200] # For debugging
+            "price": item.get("price", {}).get("min_price", 0),
+            "raw_response_snippet": str(json_data)[:200]
         }
     except Exception as e:
         logging.error(f"Error extracting product info: {e}")
         return None
 
-def monitor_product(url, duration_days=7, interval_hours=1):
+async def monitor_product(url, duration_days=7, interval_hours=1):
     start_time = datetime.now()
     end_time = start_time + timedelta(days=duration_days)
     
@@ -151,33 +135,84 @@ def monitor_product(url, duration_days=7, interval_hours=1):
     try:
         while datetime.now() < end_time:
             current_data = fetch_product_data(url)
-            
             if current_data:
-                # Save to file immediately
+                # Save locally
                 with open(MONITOR_LOG_FILE, "a") as f:
                     f.write(json.dumps(current_data) + "\n")
+                
+                # Push to Apify Dataset if available
+                if Actor:
+                    await Actor.push_data(current_data)
                 
                 logging.info(f"Data recorded: {current_data}")
             else:
                 logging.warning("No data fetched this interval.")
             
-            # Sleep logic
-            time.sleep(interval_hours * 3600)
+            # Use asyncio sleep if in async context
+            await asyncio.sleep(interval_hours * 3600)
             
+    except asyncio.CancelledError:
+        logging.info("Monitoring cancelled.")
     except KeyboardInterrupt:
         logging.info("Monitoring stopped manually.")
     
     logging.info("Monitoring finished.")
 
-if __name__ == "__main__":
-    # Example usage - Replace with a real URL or one from env/args
-    # Using a placeholder for now
-    target_url = "https://www.tiktok.com/@shop/product/example" 
-    
-    # Check if URL is passed as arg
-    import sys
-    if len(sys.argv) > 1:
-        target_url = sys.argv[1]
+async def main():
+    target_url = None
+    duration_days = 7
+    interval_hours = 1
+
+    if Actor:
+        logging.info("Running in Apify Actor environment.")
+        await Actor.init()
         
-    # Set to very short interval for testing
-    monitor_product(target_url, duration_days=7, interval_hours=1)
+        # Get input
+        actor_input = await Actor.get_input() or {}
+        logging.info(f"Received input: {actor_input}")
+        
+        # Parse input
+        if "startUrls" in actor_input:
+            start_urls = actor_input.get("startUrls", [])
+            if start_urls and len(start_urls) > 0:
+                # Check structure
+                first_url = start_urls[0]
+                if isinstance(first_url, dict):
+                    target_url = first_url.get("url")
+                elif isinstance(first_url, str):
+                    target_url = first_url
+        
+        if not target_url and "url" in actor_input:
+             target_url = actor_input.get("url")
+             
+        # Override duration/interval if provided
+        if "duration_days" in actor_input:
+            duration_days = int(actor_input.get("duration_days"))
+        if "interval_hours" in actor_input:
+            interval_hours = float(actor_input.get("interval_hours"))
+
+    else:
+        logging.info("Running in standalone environment.")
+        # Command line args fallback
+        if len(sys.argv) > 1:
+            target_url = sys.argv[1]
+
+    if not target_url:
+        logging.error("No target URL provided via input or arguments.")
+        if Actor:
+            await Actor.fail(status_message="No target URL provided.")
+            await Actor.exit()
+        sys.exit(1)
+
+    # Run monitoring
+    await monitor_product(target_url, duration_days, interval_hours)
+    
+    if Actor:
+        await Actor.exit()
+
+if __name__ == "__main__":
+    if Actor:
+        asyncio.run(main())
+    else:
+        # Simple blocking run if no Actor lib (though async def main needs loop)
+        asyncio.run(main())

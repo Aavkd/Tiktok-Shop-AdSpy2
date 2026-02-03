@@ -16,7 +16,7 @@ let page;
 async function initBrowser() {
     console.log('Launching browser...');
     browser = await puppeteer.launch({
-        executablePath: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
         headless: "new",
         args: [
             '--no-sandbox',
