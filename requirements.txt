@@ -1,5 +1,7 @@
 requests
+curl_cffi
 protobuf
 selenium
 playwright
 apify
+beautifulsoup4

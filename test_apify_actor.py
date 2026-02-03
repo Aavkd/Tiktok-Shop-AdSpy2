@@ -48,9 +48,8 @@ def run_actor(input_data):
 
 def test_single_product():
     scenario = "Single Product"
-    # Using a dummy product structure. 
-    # Realistically, without a known valid product, this tests 404 handling or scraping logic.
-    url = "https://www.tiktok.com/@view/product/1729384756" 
+    # Using a discovered valid product URL
+    url = "https://shop.tiktok.com/view/product/1729427175685067055?region=US&locale=en" 
     input_data = {"startUrls": [{"url": url}]}
     
     run = run_actor(input_data)

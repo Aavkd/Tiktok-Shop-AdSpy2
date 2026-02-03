@@ -4,7 +4,9 @@ import json
 import logging
 import time
 import requests
+from curl_cffi import requests as cffi_requests
 import asyncio
+import re
 from datetime import datetime, timedelta
 
 # Try importing Apify Actor SDK
@@ -34,13 +36,101 @@ def get_signed_url(url):
             return None
         data = json_resp.get("data")
         return data
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error getting signature: {e}")
+    except Exception as e:
+        logging.error(f"Error calling signature service: {e}")
+        return None
+
+def parse_html_for_data(html_content, product_url):
+    """
+    Parses HTML content to find embedded JSON data (SIGI_STATE, __UNIVERSAL_DATA, etc.).
+    """
+    logging.info("Parsing HTML for embedded data...")
+    
+    # List of patterns to look for
+    patterns = [
+        r'<script id="SIGI_STATE" type="application/json">(.*?)</script>',
+        r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">(.*?)</script>',
+        r'window\[\'SIGI_STATE\'\]\s*=\s*({.*?});',
+        r'window\.__UNIVERSAL_DATA_FOR_REHYDRATION__\s*=\s*({.*?});'
+    ]
+    
+    json_data = None
+    
+    for pattern in patterns:
+        match = re.search(pattern, html_content, re.DOTALL)
+        if match:
+            try:
+                json_str = match.group(1)
+                json_data = json.loads(json_str)
+                logging.info(f"Found JSON data using pattern: {pattern[:20]}...")
+                break
+            except json.JSONDecodeError as e:
+                logging.warning(f"Found match but failed to decode JSON: {e}")
+                continue
+                
+    if not json_data:
+        logging.warning("No JSON data found in HTML.")
+        # Attempt fallback: Look for "ItemModule" or similar direct structures if full hydration failed
+        return None
+
+    # Extraction Logic
+    # The structure varies. We need to find the Product info.
+    try:
+        # Common paths in SIGI_STATE / Universal Data
+        # 1. ItemModule -> <id>
+        # 2. ProductDetail -> ...
+        # 3. 'webapp.video-detail' -> ...
+        
+        product_info = {}
+        
+        # Helper to find product data in nested dicts
+        # We look for "stock" and "price" keys
+        
+        # Strategy: Flatten or search? 
+        # Let's try known paths first.
+        
+        item_data = None
+        
+        if "ItemModule" in json_data:
+            # Usually keyed by video ID or product ID
+            for key, val in json_data["ItemModule"].items():
+                if val and ("price" in val or "stock" in val):
+                    item_data = val
+                    break
+                    
+        if not item_data and "ProductDetail" in json_data:
+             item_data = json_data.get("ProductDetail")
+
+        # Universal Data structure (e.g. from __UNIVERSAL_DATA__)
+        if not item_data and "__DEFAULT_SCOPE__" in json_data:
+             scope = json_data["__DEFAULT_SCOPE__"]
+             if "webapp.product-detail" in scope:
+                 item_data = scope["webapp.product-detail"].get("productInfo")
+        
+        if item_data:
+            return {
+                "timestamp": datetime.now().isoformat(),
+                "url": product_url,
+                "product_id": item_data.get("id") or item_data.get("product_id") or "unknown",
+                "title": item_data.get("title") or item_data.get("name"),
+                "total_stock": item_data.get("stock", 0) or item_data.get("quantity", 0),
+                "total_sold": item_data.get("sold_count", 0) or item_data.get("sales", 0),
+                "price": item_data.get("price", {}).get("min_price") or item_data.get("price", 0),
+                "currency": item_data.get("price", {}).get("currency") or "USD",
+                "status": "active" if item_data.get("status") == 1 else "inactive",
+                "raw_response_snippet": "HTML Parsing Success"
+            }
+            
+        logging.warning("JSON found but could not locate specific Product Info inside.")
+        return None
+
+    except Exception as e:
+        logging.error(f"Error extracting data from JSON: {e}")
         return None
 
 def fetch_product_data(product_url):
     """
-    Fetches product data using signed requests.
+    Fetches product data using signed requests and curl_cffi for TLS impersonation.
     """
     logging.info(f"Fetching data for {product_url}...")
     
@@ -75,11 +165,25 @@ def fetch_product_data(product_url):
     headers = {
         "User-Agent": user_agent,
         "Cookie": cookies,
-        "Referer": "https://www.tiktok.com/",
+        "Referer": "https://www.tiktok.com/"
     }
 
+    # Proxy Configuration
+    proxies = None
+    if os.environ.get("HTTP_PROXY"):
+        proxies = {"http": os.environ.get("HTTP_PROXY"), "https": os.environ.get("HTTPS_PROXY")}
+    
     try:
-        response = requests.get(signed_url, headers=headers)
+        # Use curl_cffi with Chrome impersonation
+        # Note: We override User-Agent to match the signature.
+        logging.info("Sending request via curl_cffi with impersonate='chrome124'...")
+        response = cffi_requests.get(
+            signed_url, 
+            headers=headers, 
+            impersonate="chrome124",
+            proxies=proxies,
+            timeout=30
+        )
         response.raise_for_status()
         
         content_type = response.headers.get("Content-Type", "")
@@ -95,11 +199,19 @@ def fetch_product_data(product_url):
             except json.JSONDecodeError:
                 logging.error("Failed to decode JSON response.")
                 return None
+        elif "text/html" in content_type:
+            # Decode content to string (handle encoding)
+            try:
+                html_text = response.content.decode('utf-8', errors='ignore')
+                return parse_html_for_data(html_text, product_url)
+            except Exception as e:
+                logging.error(f"Error processing HTML: {e}")
+                return None
         else:
             logging.warning(f"Response content type is {content_type}. Might be Protobuf.")
             return None
 
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         logging.error(f"Request failed: {e}")
         return None
 
@@ -184,6 +296,10 @@ async def main():
         
         if not target_url and "url" in actor_input:
              target_url = actor_input.get("url")
+
+        # Check command line args if input didn't provide URL (useful for local testing with Actor lib installed)
+        if not target_url and len(sys.argv) > 1:
+            target_url = sys.argv[1]
              
         # Override duration/interval if provided
         if "duration_days" in actor_input:
